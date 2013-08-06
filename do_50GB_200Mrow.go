@@ -1,150 +1,366 @@
-题目来源：http://www.iteye.com/topic/1131438
+package main
 
-下面是摘录楼主的相关描述
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"runtime"
+	"strconv"
+	"time"
+)
 
->我有一个文件，一共100列，每个列以 tab 分开，第二列是一个 15位 的整数（此列是乱序的） 
->文件行数在2亿行之内，文件很大，大约 50G 左右。现在要求我找出 满足这种条件的行：第二列的整数，在此文件中，出现过2次或2次以上 
-	
->有啥好办法嘛？ 
->我现在这么搞的：将文件尽量分成小文件（保证同样的数字分到同一个小文件中），使得此文件可以整个load到内存中。然后对内存中的数据使用set看是否曾经重复出现过 
->根据最后一位的值（0, 1, ..., 9），分成10个child文件。如果某个child文件还大于512M（我JVM内存比512大一点点，可以load整个文件），在根据第二位再分割此child文件，得到 grandchild文件；如果grandchild文件还是大于512M，则根据第三位分割...... 
-	
-	
->缺点：太耗时，以至于不现实，要1个多小时 
-	
->PS：我将 JVM 最大heap设为 1024M，然后，测试将Long加入到set中，发现，可以创建 1700W个Long对象（Integer对象也是这么多）。到production环境中，我估计heap可以设置到8G，但是，即使这样，也只有1.6亿的Long（或者Integer），所以，肯定还是不能够读入所有的 整数，然后使用set判断哪个曾经出现过2次或2次以上 
-	
->各位，有好办法嘛？我只要知道哪些整数曾经出现过2次或2次以上即可（分不分文件、出现的确切次数 我都不在乎） 
-	
->另外：不要建议分布式啥的，这个也用不起来，我这就是一个 standalone 的应用
->国际漫游，数据量非常大。这是运营商提供的数据，我们不能控制
+var (
+	part_files = make(map[int]*os.File, 1000)
+	part_buffs = make(map[int]*bytes.Buffer, 1000)
 
-## 15位数字的组成
-当时lz也说了，“这不是面试题，这是现实遇到的”。于是上网挖掘了下潜在的需求，猜测15位的手机号码是这么一个组成：
+	toDisk  = make(chan *_w_objcet, 1<<8)
+	toParse = make(chan []byte, 1<<8)
 
-	4位国家代码 + 11位手机号码。
+	waitToDiskDone = make(chan bool)
 
+	readPiece  = 1 << 20 // lines for every read, and yes, it's Monkey.D.Luffy
+	writePiece = 1 << 16 // lines for every write, and yes, it's Monkey.D.Luffy
 
-### 4位国家代码
+	allLines = 0
+	repeated = 0
 
+	start int64 // start time
+)
 
-然后第一直觉就是，所谓的4位国家号码，表面看有9999种可能性，实际地球上的国家或者地区是有限的，实际可能性很少，上网一查，果真如此，大概有不到200的可能性：
+type Bitmap struct {
+	Shift uint32
+	Mask  uint32
+	Max   uint32
 
-			
-	country_code = []string{
-		"0001", "0007", "0020", "0027", "0030", "0031", "0032", "0033", "0034", "0036", "0039", "0040", "0041", "0043", "0044", "0045", "0046", "0047", "0048", "0049",
-		"0051", "0052", "0053", "0054", "0055", "0056", "0057", "0058", "0060", "0061", "0062", "0063", "0064", "0065", "0066", "0081", "0082", "0084", "0086", "0090",
-		"0091", "0092", "0093", "0094", "0095", "0098", "0212", "0213", "0216", "0218", "0220", "0221", "0223", "0224", "0225", "0226", "0228", "0229", "0230", "0231",
-		"0232", "0233", "0234", "0235", "0236", "0237", "0239", "0241", "0242", "0243", "0244", "0247", "0248", "0249", "0251", "0252", "0253", "0254", "0255", "0256",
-		"0257", "0258", "0260", "0261", "0262", "0263", "0264", "0265", "0266", "0267", "0268", "0327", "0331", "0350", "0351", "0352", "0353", "0354", "0355", "0356",
-		"0357", "0358", "0359", "0370", "0371", "0372", "0373", "0374", "0375", "0376", "0377", "0378", "0380", "0381", "0386", "0420", "0421", "0423", "0501", "0502",
-		"0503", "0504", "0505", "0506", "0507", "0509", "0591", "0592", "0593", "0594", "0595", "0596", "0597", "0598", "0599", "0673", "0674", "0675", "0676", "0677",
-		"0679", "0682", "0684", "0685", "0689", "0850", "0852", "0853", "0855", "0856", "0880", "0886", "0960", "0961", "0962", "0963", "0964", "0965", "0966", "0967",
-		"0968", "0970", "0971", "0972", "0973", "0974", "0976", "0977", "0992", "0993", "0994", "0995", "1242", "1246", "1264", "1268", "1345", "1441", "1664", "1670",
-		"1671", "1758", "1784", "1787", "1809", "1876", "1890",
-	}	
+	Data []uint32
+}
 
-### 11位手机号码
-手机号码大家都比较熟悉，前3位是网段识别代码，只有这31种可能：
+func NewBitmap() *Bitmap {
+	bm := &Bitmap{
+		Shift: 5,
+		Mask:  0x1F,
+	}
+	// bm.Data = make([]uint32, 16)
+	bm.Data = make([]uint32, 1<<25)
+	// bm.Data = reused[:0]
 
-	net_code = []string{
-		"133", "153", "180", "181", "189", // China Telecom
-		"130", "131", "132", "145", "155", "156", "185", "186", // China Unicom
-		"134", "135", "136", "137", "138", "139", "147", "150", "151", "152", "157", "158", "159", "182", "183", "184", "187", "188", // CMCC
+	return bm
+}
+
+func (bm *Bitmap) idx_of_ints(momoid uint32) uint32 {
+	return momoid >> bm.Shift // momoid / 32
+}
+
+func (bm *Bitmap) valueByOffset(momoid uint32) uint32 {
+	return 1 << (momoid & bm.Mask) // 1 << ( momoid % 32 )
+}
+
+func (bm *Bitmap) Put(momoid uint32) {
+	if momoid > bm.Max {
+		bm.Max = momoid
 	}
 
+	idx := bm.idx_of_ints(momoid)
 
+	if oldSize := len(bm.Data); int(idx) >= oldSize {
+		tmp := make([]uint32, idx+32)
+		for i := 0; i < oldSize; i++ {
+			tmp[i] = bm.Data[i]
+		}
+		bm.Data = tmp
+	}
 
-## 15位数字拆分
-这样，可以把15位数字拆成： 
+	v := bm.valueByOffset(momoid)
+	bm.Data[idx] |= v
+}
 
-	（4位国家代码 + 3位网段识别代码） + 8位数字
-	
-其中最后一段8位数字，已经满足Uint32(4个Byte)的要求。但是前7位的可能性还是太多：200 × 31， 如果拆分成差不多6000左右的文件数，太多的文件描述符，这不是不可以，这个对系统要求也比较高，尤其当我们只是把这个程序运行在自己的笔记本上。干脆这样分：
+func (bm *Bitmap) Contains(momoid uint32) bool {
+	idx := bm.idx_of_ints(momoid)
+	if int(idx) >= len(bm.Data) {
+		return false
+	}
 
-	（4位国家代码 + 2位代码） + 9位数字
+	v := bm.valueByOffset(momoid)
 
-这样最后一段9位数字依然满足Uint32(4个Byte)的要求。同时前6位数字的可能性也不是太多：200 × 5，大概1000个左右的可能。其中第5、6两位数字的组成只有5种可能性。
+	return bm.Data[idx]&v == v
+}
 
-	
+// Convert uint32 to []byte
+func Uint32ToBytes(v uint32) []byte {
+	b := make([]byte, 4)
+	b[0] = byte(v >> 24)
+	b[1] = byte(v >> 16)
+	b[2] = byte(v >> 8)
+	b[3] = byte(v)
 
+	return b
+}
 
-## 生成50G的大文件
-实际任务就是随机生成每行第2列的随机数字，并且加入重复的可能性。实验了下单线程（[代码](https://github.com/hardPass/50G_15_200MBlines/blob/master/genfile.go)），和双线（[代码](https://github.com/hardPass/50G_15_200MBlines/blob/master/genfile_concurrent.go)）。实际双线程用时12分钟左右，单线程稍微慢些。双线程的逻辑，就是一个线程只管io操作写文件，另一个线程只管生成数据。（注：Go语言不是线程的概念，称为Goroutine）
+// Convert []byte to uint32
+func BytesToUint32(b []byte) uint32 {
+	return uint32(b[3]) | uint32(b[2])<<8 | uint32(b[1])<<16 | uint32(b[0])<<24
+}
 
+func concat(a, b []byte) []byte {
+	buf := bytes.NewBuffer(make([]byte, 0, len(a)+len(b)))
+	buf.Write(a)
+	buf.Write(b)
 
-	concurrent
-	-----------------------
-	Done in 704770 ms!
-	allLines 200003584
-	total 53600960512 byte equals 51117 MB
-	repeated 66654904
-	torepeat 66679715
+	return buf.Bytes()
+}
 
+type _w_objcet struct {
+	f    *os.File
+	data []byte
+}
 
-	single thread
-	-----------------------
-	Done in 798330 ms!
-	allLines 200003584
-	total 53600960512 byte equals 51117 MB
-	repeated 66663090
-	torepeat 66668163
-	
-	798330 / 704770 = 113.275%
-	704770 / 798330 = 88.28%
+func flush(n6 int) {
+	f := part_files[n6]
+	var err error
+	if f == nil {
+		fn := fmt.Sprintf("./parts/%d.part", n6)
+		f, err = os.OpenFile(fn, os.O_RDWR|os.O_CREATE, 0600)
+		if err != nil {
+			fmt.Printf("Error line open %s: %s\n", fn, err)
+			os.Exit(-1)
+		}
 
+		part_files[n6] = f
+	}
 
-## 50G大文件的具体解析程序分成两个阶段：
-代码：https://github.com/hardPass/50G_15_200MBlines/blob/master/do_50GB_200Mrow.go
+	buf := part_buffs[n6]
+	toDisk <- &_w_objcet{f, buf.Bytes()}
+	part_buffs[n6] = nil
+}
 
-### 第1阶段 拆分
-即读大文件，根据前6位数字（称为n6），把后9位数字（称为n9）写入不同的文件里（文件名以n6区分）。
+func flushAll() {
+	for n6, _ := range part_buffs {
+		flush(n6)
+	}
+}
 
-可以预计的是，在整个程序运行过程中，这个阶段所占用的时间应该最多，而且占用绝大多数的时间。
+func line(b []byte) {
+	allLines++
 
-这个阶段的运行逻辑是，分成3个线程（同上, Go里面是Goroutine）:
-* loopRead，即依次遍历读50G的大文件，每次读固定的字节数（readPiece  = 1 << 20），即每次读一个块（这边称piece），并将这个piece放入到chan（toParse = make(chan []byte, 1<<8)，参考java中的BlockQueue）中，传递给loopParse的routine。
+	n := bytes.IndexByte(b, ' ')
+	n6, _ := strconv.Atoi(string(b[n+1 : n+7]))
+	n9, _ := strconv.Atoi(string(b[n+7 : n+16]))
 
-* loopParse，即将循环处理loopRead传递过来的每个piece，其中有拆分的逻辑，封装成方便写操作的东西，放入到chan（toDisk  = make(chan *_w_objcet, 1<<8)）中，传递给 loopWrite 的routine。
+	buf := part_buffs[n6]
+	if buf == nil {
+		buf = bytes.NewBuffer(make([]byte, 0, writePiece+8))
+		part_buffs[n6] = buf
+	}
 
-* loopWrite，即写小文件操作
+	b4 := Uint32ToBytes(uint32(n9))
+	buf.Write(b4)
 
-### 第2阶段 处理小文件
-依次分析这些小文件，取出重复出现的，写入到结果文件中。其中用到了Bitmap。
+	if buf.Len() >= writePiece {
+		flush(n6)
+	}
+}
 
-因为可预计这个阶段所用的时间不会太多，故单线程处理了。
+func parse(remains, b []byte) []byte {
+	if len(remains) > 0 {
+		n := bytes.IndexByte(b, '\n')
+		if n == -1 {
+			return concat(remains, b)
+		}
 
+		line(concat(remains, b[:n]))
+		b = b[n+1:]
+	}
 
+	for {
+		n := bytes.IndexByte(b, '\n')
+		if n == -1 {
+			return b
+		}
 
-## 最终实验结果
-在没有进一步优化、并且输出了很多到Console的日志的情况下，整个运行时间不到17分钟。其中第一阶段用了15分钟。
-其中找到的重复数字列表在result.txt中，694MB。
+		// line(b[:n])
+		line(b)
 
+		n++
+		if len(b) == n {
+			return nil
+		}
 
-	loopRead done, all spend: 895922 ms
-	loopParse read lines: 200003584, total read: 51117MB, spends: 895950ms
-	part: 178713 start, all spend: 896060 ms
-	part: 178713 ltrip, all spend: 896230 ms
-	part: 178713 done , all spend: 896269 ms
-	part: 035118 start, all spend: 896269 ms
-	part: 035118 ltrip, all spend: 896910 ms
-	part: 035118 done , all spend: 896955 ms
-	...
-	part: 008414 start, all spend: 1016779 ms
-	part: 008414 ltrip, all spend: 1016835 ms
-	part: 008414 done , all spend: 1016842 ms
-	part: 004814 start, all spend: 1016843 ms
-	part: 004814 ltrip, all spend: 1016897 ms
-	part: 004814 done , all spend: 1016913 ms
-	
-	-----------------------
-	Done in 1016914 ms!
-	read 200003584 lines
-	
-	
+		b = b[n+1:]
 
+	}
+}
 
+func loopParse() {
+	total := 0
+	round := 1 << 20
+	rounds := 0
+	var remains []byte
+	for {
+		select {
+		case b, ok := <-toParse:
+			if !ok {
+				flushAll()
+				close(toDisk)
+				fmt.Println("loopParse done! Read lines: %d, total read: %dMB, spends: %dms \n", allLines, total/(1<<20), (time.Now().UnixNano()-start)/(1000*1000))
 
+				return
+			}
 
+			total += len(b)
+			remains = parse(remains, b)
 
+			if allLines > rounds {
+				rounds += round
+				fmt.Printf("lines read:%d, total read:%dMB, spends:%dms \n", allLines, total/(1<<20), (time.Now().UnixNano()-start)/(1000*1000))
+			}
+		}
+	}
+}
 
+func loopRead(fi *os.File) {
+	for {
+		b := make([]byte, readPiece)
+		n, err := fi.Read(b)
+		if n > 0 {
+			toParse <- b[:n]
+		}
+
+		if err != nil {
+			// fmt.Printf("loopRead %d bytes, err: %s\n", n, err)
+			close(toParse)
+			break
+		}
+	}
+
+	fmt.Printf("loopRead done, all spend: %d ms \n", (time.Now().UnixNano()-start)/(1000*1000))
+
+}
+
+func loopWrite() {
+	total := 0
+	round := 1 << 20
+	rounds := 0
+	for {
+		select {
+		case wo, ok := <-toDisk:
+			if !ok {
+				fmt.Printf("loopWrite done to partfiles%dMB , all spend: %d ms \n", total/(1<<20), (time.Now().UnixNano()-start)/(1000*1000))
+				waitToDiskDone <- true
+				return
+			}
+
+			n, err := wo.f.Write(wo.data)
+			if err != nil {
+				fmt.Printf("Error write wo.data: %s\n", err)
+				os.Exit(-1) // todo
+
+			}
+
+			total += n
+			if total > rounds {
+				rounds += round
+				fmt.Printf("loopWrite to partfiles %dMB , all spend: %d ms \n", total/(1<<20), (time.Now().UnixNano()-start)/(1000*1000))
+			}
+		}
+	}
+
+}
+
+func onePart(n6 int, part *os.File, result *os.File, tmp_slice []uint32) {
+	fmt.Printf("part: %s start, all spend: %d ms \n", fmt.Sprintf("%06d", n6), (time.Now().UnixNano()-start)/(1000*1000))
+	bmp := NewBitmap()
+	bmp_repeated := NewBitmap()
+	repeated_slice := tmp_slice[:0]
+	// fmt.Printf("part: %s alloc, all spend: %d ms \n", fmt.Sprintf("%06d", n6), (time.Now().UnixNano()-start)/(1000*1000))
+	b := make([]byte, 1<<17*4)
+	part.Seek(0, 0)
+	for {
+		n, err := part.Read(b)
+		if n > 0 {
+			for i := 0; i < n; i += 4 {
+				v := BytesToUint32(b[i : i+4])
+				if bmp.Contains(v) {
+					if !bmp_repeated.Contains(v) {
+						repeated_slice = append(repeated_slice, v)
+						bmp_repeated.Put(v)
+					}
+				} else {
+					bmp.Put(v)
+				}
+			}
+
+		}
+		if err != nil {
+			break
+		}
+	}
+	fmt.Printf("part: %s ltrip, all spend: %d ms \n", fmt.Sprintf("%06d", n6), (time.Now().UnixNano()-start)/(1000*1000))
+
+	buf := bytes.NewBuffer(make([]byte, 0, 1<<19))
+	s6 := fmt.Sprintf("%06d", n6)
+	for i := 0; i < len(repeated_slice); i++ {
+		repeated++
+		s9 := fmt.Sprintf("%09d", int(repeated_slice[i]))
+		buf.WriteString(s6)
+		buf.WriteString(s9)
+		buf.WriteByte('\n')
+		if buf.Len() > 524272 {
+			result.Write(buf.Bytes())
+			buf = bytes.NewBuffer(make([]byte, 0, 1<<19))
+		}
+	}
+	result.Write(buf.Bytes())
+	fmt.Printf("part: %s done , all spend: %d ms \n", fmt.Sprintf("%06d", n6), (time.Now().UnixNano()-start)/(1000*1000))
+
+	return
+}
+
+func main() {
+	if err := os.Mkdir("./parts", 0666); err != nil {
+		// fmt.Printf("Error: %v\n", err)
+	} else {
+		fmt.Printf("./parts/ has been created!\n")
+	}
+
+	f_50g, err := os.OpenFile("./50g/50g.log", os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		fmt.Printf("Error f_50g: %s\n", err)
+		return
+	}
+	defer f_50g.Close()
+
+	f_result, err := os.OpenFile("./result.txt", os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		fmt.Printf("Error f_result: %s\n", err)
+		return
+	}
+	defer f_result.Close()
+
+	runtime.GOMAXPROCS(4)
+
+	fmt.Println("Begin ...")
+	start = time.Now().UnixNano()
+	f_50g.Seek(0, 0)
+
+	go loopWrite()
+
+	go loopParse()
+
+	go loopRead(f_50g)
+
+	<-waitToDiskDone
+
+	fmt.Println("read little parts files ...")
+
+	tmp_slice := make([]uint32, 0, 1<<26)
+	for n6, part := range part_files {
+		onePart(n6, part, f_result, tmp_slice)
+		part.Close()
+	}
+
+	end := time.Now().UnixNano()
+	fmt.Printf("\n-----------------------\n")
+	fmt.Printf("Done in %d ms!\n", (end-start)/(1000*1000))
+	fmt.Printf("read %d lines\n", allLines)
+	fmt.Printf("repeated %d\n", repeated)
+}
