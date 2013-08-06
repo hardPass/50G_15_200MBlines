@@ -71,7 +71,7 @@
 
 
 ## 生成50G的大文件
-实际任务就是随机生成每行第2列的随机数字，并且加入重复的可能性。实验了下单线程，和双线。实际双线程用时12分钟左右，单线程稍微慢些。双线程的逻辑，就是一个线程只管io操作写文件，另一个线程只管生成数据。（注：Go语言不是线程的概念，称为Goroutine）
+实际任务就是随机生成每行第2列的随机数字，并且加入重复的可能性。实验了下单线程（代码：https://github.com/hardPass/50G_15_200MBlines/blob/master/genfile.go），和双线（代码：https://github.com/hardPass/50G_15_200MBlines/blob/master/genfile_concurrent.go）。实际双线程用时12分钟左右，单线程稍微慢些。双线程的逻辑，就是一个线程只管io操作写文件，另一个线程只管生成数据。（注：Go语言不是线程的概念，称为Goroutine）
 
 
 	concurrent
@@ -96,6 +96,7 @@
 
 
 ## 50G大文件的具体解析程序分成两个阶段：
+代码：https://github.com/hardPass/50G_15_200MBlines/blob/master/do_50GB_200Mrow.go
 
 ### 第1阶段 拆分
 即读大文件，根据前6位数字（称为n6），把后9位数字（称为n9）写入不同的文件里（文件名以n6区分）。
